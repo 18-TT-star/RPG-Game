@@ -37,24 +37,15 @@ TILE_COLORS = {
 # 衝突するタイル
 SOLID_TILES = {WALL, TREE, WATER}
 
-# ─── マップデータ (16列 × 11行) ───────────────────────────
+# ─── タイル記号 & ダンジョングリッド定数 ───────────────────────────
 # W=壁, F=床, T=木, A=水, P=砂道, D=扉
 _W, _F, _T, _A, _P, _D = WALL, FLOOR, TREE, WATER, PATH, DOOR
 
-# room 0: メインマップ（左壁=宝部屋, 下壁=モンスターハウス, 右壁=行商人）
-MAP = [
-    [_W, _W, _W, _W, _W, _W, _W, _D, _D, _W, _W, _W, _W, _W, _W, _W],  # 上壁に通路
-    [_W, _F, _F, _F, _T, _F, _F, _P, _P, _F, _F, _T, _F, _F, _F, _W],
-    [_W, _F, _T, _F, _F, _F, _F, _P, _P, _F, _F, _F, _F, _T, _F, _W],
-    [_W, _F, _F, _F, _F, _F, _F, _P, _P, _F, _F, _F, _F, _F, _F, _W],
-    [_D, _T, _F, _F, _A, _A, _F, _P, _P, _F, _A, _A, _F, _F, _T, _D],
-    [_D, _F, _F, _F, _A, _A, _F, _P, _P, _F, _A, _A, _F, _F, _F, _D],
-    [_W, _F, _F, _F, _F, _F, _F, _P, _P, _F, _F, _F, _F, _F, _F, _W],
-    [_W, _F, _T, _F, _F, _F, _F, _P, _P, _F, _F, _F, _F, _T, _F, _W],
-    [_W, _F, _F, _F, _F, _F, _F, _P, _P, _F, _F, _F, _F, _F, _F, _W],
-    [_W, _F, _F, _T, _F, _F, _F, _P, _P, _F, _F, _F, _T, _F, _F, _W],
-    [_W, _W, _W, _W, _W, _W, _W, _W, _W, _W, _W, _W, _W, _W, _W, _W],  # 下壁は全壁
-]
+# ダンジョン: 5×5 グリッド配置
+GRID_ROWS  = 5
+GRID_COLS  = 5
+N_ROOMS    = GRID_ROWS * GRID_COLS           # 25
+START_ROOM = (GRID_ROWS - 1) * GRID_COLS + GRID_COLS // 2  # 22 (下段中央)
 
 
 # ─── ランダム部屋生成 ────────────────────────────────────────────────
@@ -107,64 +98,60 @@ ROOM_EXITS: dict = {}
 ROOM_TYPES: dict = {}
 
 # 現在の部屋マップ（_solid_at系が参照するグローバル）
-CURRENT_MAP: list = MAP
+CURRENT_MAP: list = []
 
 
 def build_dungeon() -> None:
-    """ゲーム開始/リスタートごとに部屋グラフを再構築する"""
+    """ゲーム開始/リスタートごとに 5×5 ダンジョングリッドを再構築する"""
     global ROOM_MAPS, ROOM_EXITS, ROOM_TYPES
-    # サブ部屋3つは全4方向に通路付きでランダム生成
-    ROOM_MAPS = {
-        0: MAP,
-        1: generate_room(),
-        2: generate_room(),
-        3: generate_room(),
-    }
-    types = ["monster", "treasure", "shop"]
-    random.shuffle(types)
-    ROOM_TYPES = {0: "main", 1: types[0], 2: types[1], 3: types[2]}
-    ROOM_EXITS.clear()
+    ROOM_MAPS  = {}
+    ROOM_EXITS = {}
+    ROOM_TYPES = {}
 
-    # メイン(0) → サブ部屋
-    ROOM_EXITS[(0, 7,  0)] = (1,  7,  9)   # 上壁 → room1 下側内側
-    ROOM_EXITS[(0, 8,  0)] = (1,  7,  9)
-    ROOM_EXITS[(0, 0,  4)] = (2, 13,  5)   # 左壁 → room2 右側内側
-    ROOM_EXITS[(0, 0,  5)] = (2, 13,  5)
-    ROOM_EXITS[(0, 15, 4)] = (3,  2,  5)   # 右壁 → room3 左側内側
-    ROOM_EXITS[(0, 15, 5)] = (3,  2,  5)
+    # 各部屋をグリッド位置に応じた通路で生成（境界壁には扉なし）
+    for gr in range(GRID_ROWS):
+        for gc in range(GRID_COLS):
+            room_id    = gr * GRID_COLS + gc
+            has_top    = gr > 0
+            has_bottom = gr < GRID_ROWS - 1
+            has_left   = gc > 0
+            has_right  = gc < GRID_COLS - 1
+            ROOM_MAPS[room_id] = generate_room(has_top, has_bottom, has_left, has_right)
 
-    # サブ部屋 → メイン(0) 帰り口
-    ROOM_EXITS[(1,  7, 10)] = (0,  7,  2)  # room1 下壁 → メイン
-    ROOM_EXITS[(1,  8, 10)] = (0,  7,  2)
-    ROOM_EXITS[(2, 15,  4)] = (0,  2,  5)  # room2 右壁 → メイン
-    ROOM_EXITS[(2, 15,  5)] = (0,  2,  5)
-    ROOM_EXITS[(3,  0,  4)] = (0, 13,  5)  # room3 左壁 → メイン
-    ROOM_EXITS[(3,  0,  5)] = (0, 13,  5)
+    # 部屋タイプ割り当て（スタート部屋は 'main'、残りはランダム）
+    other_rooms = [i for i in range(N_ROOMS) if i != START_ROOM]
+    n_others    = len(other_rooms)   # 24
+    n_monster   = n_others // 2     # 12
+    type_list   = ['monster'] * n_monster + ['treasure'] * (n_others - n_monster)
+    random.shuffle(type_list)
+    ROOM_TYPES[START_ROOM] = 'main'
+    for room_id, rtype in zip(other_rooms, type_list):
+        ROOM_TYPES[room_id] = rtype
 
-    # サブ部屋同士（帰り口以外の3方向 → ランダムに別サブへ）
-    # room1 (帰り口は下壁) → 上/左/右通路から {2,3} へ
-    for (tc, tr), (sc, sr) in [
-        ((7,  0), (7,  9)), ((8,  0), (7,  9)),
-        ((0,  4), (13, 5)), ((0,  5), (13, 5)),
-        ((15, 4), ( 2, 5)), ((15, 5), ( 2, 5)),
-    ]:
-        ROOM_EXITS[(1, tc, tr)] = (random.choice([2, 3]), sc, sr)
-
-    # room2 (帰り口は右壁) → 上/下/左通路から {1,3} へ
-    for (tc, tr), (sc, sr) in [
-        ((7,  0), (7,  9)), ((8,  0), (7,  9)),
-        ((7, 10), (7,  1)), ((8, 10), (7,  1)),
-        ((0,  4), (13, 5)), ((0,  5), (13, 5)),
-    ]:
-        ROOM_EXITS[(2, tc, tr)] = (random.choice([1, 3]), sc, sr)
-
-    # room3 (帰り口は左壁) → 上/下/右通路から {1,2} へ
-    for (tc, tr), (sc, sr) in [
-        ((7,  0), (7,  9)), ((8,  0), (7,  9)),
-        ((7, 10), (7,  1)), ((8, 10), (7,  1)),
-        ((15, 4), ( 2, 5)), ((15, 5), ( 2, 5)),
-    ]:
-        ROOM_EXITS[(3, tc, tr)] = (random.choice([1, 2]), sc, sr)
+    # 隣接部屋への出口マッピング（グリッド端は出口なし）
+    for gr in range(GRID_ROWS):
+        for gc in range(GRID_COLS):
+            room_id = gr * GRID_COLS + gc
+            # 上壁 (tile row=0) → 上の部屋の下側内側 (row=9)
+            if gr > 0:
+                above = (gr - 1) * GRID_COLS + gc
+                ROOM_EXITS[(room_id,  7,  0)] = (above, 7, 9)
+                ROOM_EXITS[(room_id,  8,  0)] = (above, 7, 9)
+            # 下壁 (tile row=10) → 下の部屋の上側内側 (row=1)
+            if gr < GRID_ROWS - 1:
+                below = (gr + 1) * GRID_COLS + gc
+                ROOM_EXITS[(room_id,  7, 10)] = (below, 7, 1)
+                ROOM_EXITS[(room_id,  8, 10)] = (below, 7, 1)
+            # 左壁 (tile col=0) → 左の部屋の右側内側 (col=13)
+            if gc > 0:
+                left_r = gr * GRID_COLS + (gc - 1)
+                ROOM_EXITS[(room_id,  0,  4)] = (left_r, 13, 5)
+                ROOM_EXITS[(room_id,  0,  5)] = (left_r, 13, 5)
+            # 右壁 (tile col=15) → 右の部屋の左側内側 (col=2)
+            if gc < GRID_COLS - 1:
+                right_r = gr * GRID_COLS + (gc + 1)
+                ROOM_EXITS[(room_id, 15,  4)] = (right_r, 2, 5)
+                ROOM_EXITS[(room_id, 15,  5)] = (right_r, 2, 5)
 
 
 # ─── タイル描画 ───────────────────────────────────────────
@@ -625,59 +612,6 @@ def spawn_enemy_pos(player_x: float, player_y: float,
     return float(x), float(y)
 
 
-# ─── 行商人の屋台描画 ─────────────────────────────────────────
-def draw_shop_overlay(surf: pygame.Surface) -> None:
-    """行商人の屋台をpygame.drawで描画する（room 3専用オーバーレイ）"""
-    # ── 屋台1: 左側（col 3〜5, row 3〜6）
-    _draw_stall(surf, TILE * 3, TILE * 3)
-    # ── 屋台2: 右側（col 10〜12, row 3〜6）
-    _draw_stall(surf, TILE * 10, TILE * 3)
-
-
-def _draw_stall(surf: pygame.Surface, sx: int, sy: int) -> None:
-    """1つ分の屋台を描く。sx,syは屋台左上ピクセル座標"""
-    w = TILE * 3
-    h = TILE * 2
-    # テント屋根の柱
-    pygame.draw.rect(surf, (120, 70, 20), pygame.Rect(sx + 4,       sy, 8, h + TILE))
-    pygame.draw.rect(surf, (120, 70, 20), pygame.Rect(sx + w - 12,  sy, 8, h + TILE))
-    # テント布（三角形）
-    roof_pts = [
-        (sx,         sy + TILE // 2),
-        (sx + w,     sy + TILE // 2),
-        (sx + w // 2, sy - TILE // 2),
-    ]
-    pygame.draw.polygon(surf, (180, 60, 60), roof_pts)
-    pygame.draw.polygon(surf, (220, 90, 90), [
-        (sx + w // 2 - 20, sy + TILE // 2),
-        (sx + w // 2 + 20, sy + TILE // 2),
-        (sx + w // 2,      sy - TILE // 2 + 10),
-    ])
-    # 台（カウンター）
-    counter_rect = pygame.Rect(sx, sy + TILE, w, TILE // 2)
-    pygame.draw.rect(surf, (160, 110, 50), counter_rect)
-    pygame.draw.rect(surf, (200, 150, 80), pygame.Rect(sx + 2, sy + TILE + 2, w - 4, TILE // 2 - 4))
-    # 商品（ポーション・宝石・剣のシルエット）
-    items = [
-        (sx + TILE // 2,       sy + TILE - 14),
-        (sx + TILE + TILE // 2, sy + TILE - 12),
-        (sx + TILE * 2 + TILE // 4, sy + TILE - 14),
-    ]
-    colors = [(60, 120, 220), (180, 40, 180), (200, 200, 60)]
-    for (ix, iy), col in zip(items, colors):
-        pygame.draw.rect(surf, col, pygame.Rect(ix - 6, iy, 12, 16))
-        pygame.draw.circle(surf, tuple(min(255, c + 60) for c in col), (ix, iy), 7)
-    # 行商人（小さいキャラ）
-    mx = sx + w // 2
-    my = sy + TILE * 2 - 4
-    pygame.draw.circle(surf, (220, 180, 130), (mx, my - 14), 8)   # 頭
-    pygame.draw.rect(surf, (80, 80, 160), pygame.Rect(mx - 8, my - 6, 16, 16))  # 体
-    # 吹き出し「いらっしゃい！」
-    font = pygame.font.SysFont("msgothic", 14)
-    txt = font.render("いらっしゃい！", True, (240, 240, 60))
-    surf.blit(txt, (sx + w // 2 - txt.get_width() // 2, sy - TILE))
-
-
 # ─── 部屋遷移ヘルパー ─────────────────────────────────────────
 def enter_room(room_id: int, spawn_col: int, spawn_row: int,
                player: "Player") -> tuple:
@@ -706,17 +640,17 @@ def main() -> None:
     font_room = pygame.font.SysFont("msgothic", 18)
 
     build_dungeon()
-    current_room = 0
+    current_room = START_ROOM
     CURRENT_MAP = ROOM_MAPS[current_room]
     tile_surf = build_tile_surface(CURRENT_MAP)
 
-    # プレイヤーをマップ中央付近に配置
+    # プレイヤーをスタート部屋中央に配置
     player = Player(
         x=TILE * 7 + (TILE - Player.SIZE) // 2,
         y=TILE * 5 + (TILE - Player.SIZE) // 2,
     )
 
-    # メインルーム: 敵2体
+    # スタート部屋 (main): 敵2体
     enemies = [
         Enemy(*spawn_enemy_pos(player.x, player.y)),
         Enemy(*spawn_enemy_pos(player.x, player.y)),
@@ -730,7 +664,6 @@ def main() -> None:
         'main':     'フィールド',
         'monster':  'モンスターハウス',
         'treasure': '宝部屋',
-        'shop':     '行商人の部屋',
     }
 
     running = True
@@ -748,7 +681,7 @@ def main() -> None:
                 elif event.key == pygame.K_r and game_over:
                     # リスタート
                     build_dungeon()
-                    current_room = 0
+                    current_room = START_ROOM
                     CURRENT_MAP = ROOM_MAPS[current_room]
                     tile_surf = build_tile_surface(CURRENT_MAP)
                     player = Player(
@@ -822,8 +755,6 @@ def main() -> None:
 
         # ── 描画 ──
         screen.blit(tile_surf, (0, 0))
-        if ROOM_TYPES.get(current_room) == 'shop':
-            draw_shop_overlay(screen)
         for e in enemies:
             e.draw(screen)
         for ex in explosions:
