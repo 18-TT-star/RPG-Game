@@ -100,10 +100,14 @@ ROOM_TYPES: dict = {}
 # 現在の部屋マップ（_solid_at系が参照するグローバル）
 CURRENT_MAP: list = []
 
+# ワープポイント (build_dungeon() で設定)
+WARP_ROOM: int = 0
+WARP_TILE: tuple = (7, 5)  # (col, row)
+
 
 def build_dungeon() -> None:
     """ゲーム開始/リスタートごとに 5×5 ダンジョングリッドを再構築する"""
-    global ROOM_MAPS, ROOM_EXITS, ROOM_TYPES
+    global ROOM_MAPS, ROOM_EXITS, ROOM_TYPES, WARP_ROOM, WARP_TILE
     ROOM_MAPS  = {}
     ROOM_EXITS = {}
     ROOM_TYPES = {}
@@ -152,6 +156,47 @@ def build_dungeon() -> None:
                 right_r = gr * GRID_COLS + (gc + 1)
                 ROOM_EXITS[(room_id, 15,  4)] = (right_r, 2, 5)
                 ROOM_EXITS[(room_id, 15,  5)] = (right_r, 2, 5)
+
+    # START_ROOM のスポーン周辺（col 6-9, row 4-6）を強制クリア
+    for _r in range(4, 7):
+        for _c in range(6, 10):
+            if ROOM_MAPS[START_ROOM][_r][_c] in SOLID_TILES:
+                ROOM_MAPS[START_ROOM][_r][_c] = _F
+
+    # 全部屋のドア遷移着地点も強制クリア
+    # 上から入る → row=1, col 7-8
+    # 下から入る → row=9, col 7-8
+    # 左から入る → col=13, row 4-5
+    # 右から入る → col=2,  row 4-5
+    _spawn_areas = [
+        [(1, 7), (1, 8), (2, 7), (2, 8)],        # 上から着地
+        [(9, 7), (9, 8), (8, 7), (8, 8)],         # 下から着地
+        [(4, 13), (5, 13), (4, 12), (5, 12)],     # 左から着地
+        [(4, 2),  (5, 2),  (4, 3),  (5, 3)],      # 右から着地
+    ]
+    for rid in range(N_ROOMS):
+        gr, gc = divmod(rid, GRID_COLS)
+        areas_to_clear = []
+        if gr > 0:             areas_to_clear.append(_spawn_areas[0])
+        if gr < GRID_ROWS - 1: areas_to_clear.append(_spawn_areas[1])
+        if gc > 0:             areas_to_clear.append(_spawn_areas[2])
+        if gc < GRID_COLS - 1: areas_to_clear.append(_spawn_areas[3])
+        for area in areas_to_clear:
+            for (_r, _c) in area:
+                if ROOM_MAPS[rid][_r][_c] in SOLID_TILES:
+                    ROOM_MAPS[rid][_r][_c] = _F
+
+    # ワープポイント: START_ROOM 以外の部屋からランダムに1つ選ぶ
+    WARP_ROOM = random.choice([i for i in range(N_ROOMS) if i != START_ROOM])
+    floor_tiles = [
+        (c, r)
+        for r in range(3, ROWS - 3)
+        for c in range(3, COLS - 3)
+        if ROOM_MAPS[WARP_ROOM][r][c] == _F
+    ]
+    WARP_TILE = random.choice(floor_tiles) if floor_tiles else (7, 5)
+    # ワープタイルも確実に床にする
+    ROOM_MAPS[WARP_ROOM][WARP_TILE[1]][WARP_TILE[0]] = _F
 
 
 # ─── タイル描画 ───────────────────────────────────────────
@@ -235,6 +280,24 @@ class Player:
         self.inv_timer = 0   # ダメージ後の無敵フレーム数
         self.kbx = 0.0       # ヒットバック速度X
         self.kby = 0.0       # ヒットバック速度Y
+        self.xp          = 0  # 累積経験値
+        self.sword_level = 1  # 剣レベル (1〜4)
+
+    # 剣レベル定数
+    _XP_THRESHOLDS = [60, 150, 300]  # Lv1→2, Lv2→3, Lv3→4
+    _SWORD_NAMES   = {1: '木の剣', 2: '鉄の剣', 3: '炎の剣', 4: '伝説の剣'}
+    _SWORD_COLORS  = {1: (180, 120, 60), 2: (190, 190, 210), 3: (255, 130, 30), 4: (255, 230, 60)}
+
+    def attack_damage(self) -> int:
+        return self.sword_level
+
+    def gain_xp(self, amount: int) -> bool:
+        """経験値加算。レベルアップしたら True を返す"""
+        self.xp += amount
+        if self.sword_level < 4 and self.xp >= self._XP_THRESHOLDS[self.sword_level - 1]:
+            self.sword_level += 1
+            return True
+        return False
 
     # 移動とタイル衝突
     def update(self, keys) -> None:
@@ -316,8 +379,8 @@ class Player:
     def try_attack(self) -> bool:
         """攻撃を発動。クールダウン中は無効。"""
         if self.attack_cooldown == 0:
-            self.attack_timer    = 14
-            self.attack_cooldown = 28
+            self.attack_timer    = 8
+            self.attack_cooldown = 16
             self._attacked_set.clear()
             return True
         return False
@@ -369,13 +432,15 @@ class Player:
         shield_x = x + 2 if self.dir[0] <= 0 else x + s - 8
         pygame.draw.rect(surf, (80, 80, 200),
                          pygame.Rect(shield_x, y + 14, 6, 12))
-        # 攻撃中は剣を描画
+        # 攻撃中は剣を描画（レベルに応じた色）
         sr = self.sword_rect()
         if sr:
-            pygame.draw.rect(surf, (200, 200, 80), sr)
+            sc    = self._SWORD_COLORS[self.sword_level]
+            sc_hi = tuple(min(255, c + 50) for c in sc)
+            pygame.draw.rect(surf, sc, sr)
             hi = sr.inflate(-4, -4)
             if hi.width > 0 and hi.height > 0:
-                pygame.draw.rect(surf, (240, 240, 200), hi)
+                pygame.draw.rect(surf, sc_hi, hi)
 
 
 # ─── Enemy クラス ───────────────────────────────────────────
@@ -488,23 +553,44 @@ class Enemy:
 
 
 # ─── HUD 描画 ─────────────────────────────────────────────
-def draw_hud(surf: pygame.Surface, player: Player) -> None:
+def draw_hud(surf: pygame.Surface, player: Player, font: pygame.font.Font) -> None:
     hud_y = TILE * ROWS
-    hud_rect = pygame.Rect(0, hud_y, WIN_W, HUD_H)
-    pygame.draw.rect(surf, (20, 20, 20), hud_rect)
+    pygame.draw.rect(surf, (20, 20, 20), pygame.Rect(0, hud_y, WIN_W, HUD_H))
     pygame.draw.line(surf, (80, 80, 80), (0, hud_y), (WIN_W, hud_y), 2)
 
-    # ハート
-    heart_size = 20
-    gap        = 6
-    start_x    = 20
-    start_y    = hud_y + (HUD_H - heart_size) // 2
-
+    # ハート（上段）
+    heart_size = 18
+    gap        = 4
+    start_x    = 12
+    start_y    = hud_y + 6
     for i in range(player.max_hp):
-        hx = start_x + i * (heart_size + gap)
-        hy = start_y
         color = (220, 40, 40) if i < player.hp else (70, 70, 70)
-        _draw_heart(surf, hx, hy, heart_size, color)
+        _draw_heart(surf, start_x + i * (heart_size + gap), start_y, heart_size, color)
+
+    # 剣レベル名（ハートの右）
+    sc = Player._SWORD_COLORS[player.sword_level]
+    stxt = font.render(f"剣: {Player._SWORD_NAMES[player.sword_level]}", True, sc)
+    heart_end_x = start_x + player.max_hp * (heart_size + gap) + 8
+    surf.blit(stxt, (heart_end_x, start_y + 1))
+
+    # XPバー（下段）
+    bar_x, bar_y, bar_w, bar_h = 12, hud_y + 36, WIN_W // 2 - 20, 10
+    pygame.draw.rect(surf, (50, 50, 50), pygame.Rect(bar_x, bar_y, bar_w, bar_h))
+    if player.sword_level < 4:
+        prev  = Player._XP_THRESHOLDS[player.sword_level - 2] if player.sword_level > 1 else 0
+        nxt   = Player._XP_THRESHOLDS[player.sword_level - 1]
+        ratio = max(0.0, min(1.0, (player.xp - prev) / (nxt - prev)))
+    else:
+        ratio = 1.0
+    fill_w = int(bar_w * ratio)
+    if fill_w > 0:
+        pygame.draw.rect(surf, sc, pygame.Rect(bar_x, bar_y, fill_w, bar_h))
+    pygame.draw.rect(surf, (100, 100, 100), pygame.Rect(bar_x, bar_y, bar_w, bar_h), 1)
+    if player.sword_level == 4:
+        lbl = font.render("LEVEL MAX", True, (255, 230, 60))
+    else:
+        lbl = font.render("EXP", True, (160, 160, 160))
+    surf.blit(lbl, (bar_x + bar_w + 4, bar_y - 1))
 
 
 def _draw_heart(surf: pygame.Surface, x: int, y: int, size: int,
@@ -589,6 +675,88 @@ class Explosion:
                                (int(self.cx), int(self.cy)), ring_r, 2)
 
 
+# ─── XPオーブエフェクト ─────────────────────────────────────────────
+class XPOrb:
+    """敵死亡時に飛び散り、プレイヤーへ吸い込まれる四角い経験値オーブ"""
+    SIZE = 6
+
+    def __init__(self, cx: float, cy: float, xp_value: int) -> None:
+        angle = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(2.0, 5.0)
+        self.x   = cx
+        self.y   = cy
+        self.vx  = math.cos(angle) * speed
+        self.vy  = math.sin(angle) * speed
+        self.xp_value = xp_value
+        self._scatter = random.randint(20, 40)  # 飛び散りフェーズのフレーム数
+        self._timer   = 0
+        self.collected = False
+
+    @property
+    def alive(self) -> bool:
+        return not self.collected
+
+    def update(self, player: "Player") -> None:
+        self._timer += 1
+        if self._timer < self._scatter:
+            # 飛び散りフェーズ: 減速しながら広がる
+            self.vx *= 0.88
+            self.vy *= 0.88
+        else:
+            # 吸い込みフェーズ: プレイヤー中心へ向かう
+            pcx = player.x + player.SIZE / 2
+            pcy = player.y + player.SIZE / 2
+            dx  = pcx - (self.x + self.SIZE / 2)
+            dy  = pcy - (self.y + self.SIZE / 2)
+            dist = math.hypot(dx, dy)
+            if dist < 8:
+                self.collected = True
+                return
+            spd = min(10.0, 2.0 + (self._timer - self._scatter) * 0.15)
+            self.vx = dx / dist * spd
+            self.vy = dy / dist * spd
+        self.x += self.vx
+        self.y += self.vy
+
+    def draw(self, surf: pygame.Surface) -> None:
+        t = min(1.0, self._timer / max(1, self._scatter))
+        # 吸い込み中は明るく光る
+        if self._timer >= self._scatter:
+            col = (120, 255, 180)
+        else:
+            col = (80, 220, 120)
+        pygame.draw.rect(surf, col,
+                         pygame.Rect(int(self.x), int(self.y), self.SIZE, self.SIZE))
+        # ハイライト
+        pygame.draw.rect(surf, (200, 255, 220),
+                         pygame.Rect(int(self.x) + 1, int(self.y) + 1, 2, 2))
+
+
+# ─── ダメージ数字エフェクト ────────────────────────────────────────
+class DamageNumber:
+    DURATION = 50
+
+    def __init__(self, x: float, y: float, amount: int) -> None:
+        self.x = float(x)
+        self.y = float(y)
+        self.amount = amount
+        self.timer  = self.DURATION
+
+    @property
+    def alive(self) -> bool:
+        return self.timer > 0
+
+    def update(self) -> None:
+        self.timer -= 1
+        self.y -= 0.8
+
+    def draw(self, surf: pygame.Surface, font: pygame.font.Font) -> None:
+        t   = self.timer / self.DURATION
+        col = (255, int(200 * t), 50)
+        txt = font.render(str(self.amount), True, col)
+        surf.blit(txt, (int(self.x) - txt.get_width() // 2, int(self.y)))
+
+
 # ─── 敵スポーン位置をランダムに決定 ──────────────────────────────────
 def spawn_enemy_pos(player_x: float, player_y: float,
                     min_dist: int = 5) -> tuple[float, float]:
@@ -610,6 +778,20 @@ def spawn_enemy_pos(player_x: float, player_y: float,
     x = col * TILE + (TILE - Enemy.SIZE) // 2
     y = row * TILE + (TILE - Enemy.SIZE) // 2
     return float(x), float(y)
+
+
+# ─── ワープポイント描画 ──────────────────────────────────────────
+def draw_warp_point(surf: pygame.Surface, col: int, row: int, anim: int) -> None:
+    """水色の光輪ワープポイントを描画する"""
+    cx = col * TILE + TILE // 2
+    cy = row * TILE + TILE // 2
+    pulse = math.sin(anim * 0.08) * 4
+    r1 = int(19 + pulse)
+    r2 = int(12 + pulse * 0.6)
+    r3 = int(6  + abs(pulse) * 0.3)
+    pygame.draw.circle(surf, (0, 200, 255),   (cx, cy), r1, 3)
+    pygame.draw.circle(surf, (80, 230, 255),  (cx, cy), r2, 2)
+    pygame.draw.circle(surf, (200, 245, 255), (cx, cy), r3)
 
 
 # ─── 部屋遷移ヘルパー ─────────────────────────────────────────
@@ -638,6 +820,8 @@ def main() -> None:
     pygame.display.set_caption("Zelda-like  ─  One Screen Prototype")
     clock = pygame.time.Clock()
     font_room = pygame.font.SysFont("msgothic", 18)
+    font_hud  = pygame.font.SysFont("msgothic", 14)
+    font_dmg  = pygame.font.SysFont("msgothic", 16, bold=True)
 
     build_dungeon()
     current_room = START_ROOM
@@ -655,8 +839,12 @@ def main() -> None:
         Enemy(*spawn_enemy_pos(player.x, player.y)),
         Enemy(*spawn_enemy_pos(player.x, player.y)),
     ]
-    explosions: list = []
+    explosions:  list = []
+    damage_nums: list = []
+    xp_orbs:     list = []
     door_cooldown = 0  # 連続遷移防止
+    floor_level = 1   # 現在の階層（1が地上、潜るごとに増加）
+    warp_anim   = 0   # ワープ光輪アニメーションカウンタ
     game_over = False
 
     # 部屋タイプ名
@@ -693,7 +881,11 @@ def main() -> None:
                         Enemy(*spawn_enemy_pos(player.x, player.y)),
                     ]
                     explosions.clear()
+                    damage_nums.clear()
+                    xp_orbs.clear()
                     door_cooldown = 0
+                    floor_level = 1
+                    warp_anim   = 0
                     game_over = False
 
         # ── 更新 ──
@@ -716,7 +908,24 @@ def main() -> None:
                     current_room = dest_room
                     tile_surf, enemies = enter_room(dest_room, dest_col, dest_row, player)
                     explosions.clear()
+                    xp_orbs.clear()
                     door_cooldown = 60
+
+            # ── ワープ判定 ──
+            if door_cooldown == 0 and current_room == WARP_ROOM:
+                wcx = WARP_TILE[0] * TILE + TILE // 2
+                wcy = WARP_TILE[1] * TILE + TILE // 2
+                pcx = player.x + player.SIZE / 2
+                pcy = player.y + player.SIZE / 2
+                if abs(pcx - wcx) < TILE // 2 and abs(pcy - wcy) < TILE // 2:
+                    floor_level += 1
+                    build_dungeon()
+                    current_room = START_ROOM
+                    tile_surf, enemies = enter_room(START_ROOM, 7, 5, player)
+                    explosions.clear()
+                    damage_nums.clear()
+                    xp_orbs.clear()
+                    door_cooldown = 90
 
             # 剣の当たり判定
             sword_r = player.sword_rect()
@@ -728,15 +937,32 @@ def main() -> None:
                             _dx = (e.x + e.SIZE / 2) - (player.x + player.SIZE / 2)
                             _dy = (e.y + e.SIZE / 2) - (player.y + player.SIZE / 2)
                             _d  = max(1.0, math.hypot(_dx, _dy))
-                            e.take_damage(1, _dx / _d * 9.0, _dy / _d * 9.0)
+                            dmg = player.attack_damage()
+                            e.take_damage(dmg, _dx / _d * 9.0, _dy / _d * 9.0)
                             player._attacked_set.add(id(e))
+                            damage_nums.append(DamageNumber(
+                                e.x + e.SIZE / 2, e.y, dmg))
             for e in enemies:
                 if not e.alive:
-                    explosions.append(Explosion(e.x + e.SIZE / 2, e.y + e.SIZE / 2))
+                    cx = e.x + e.SIZE / 2
+                    cy = e.y + e.SIZE / 2
+                    explosions.append(Explosion(cx, cy))
+                    xp_amt = 5
+                    n_orbs = max(1, xp_amt // 2)
+                    for _ in range(n_orbs):
+                        xp_orbs.append(XPOrb(cx, cy, xp_amt // n_orbs))
             enemies = [e for e in enemies if e.alive]
             for ex in explosions:
                 ex.update()
             explosions = [ex for ex in explosions if ex.alive]
+            for dn in damage_nums:
+                dn.update()
+            damage_nums = [dn for dn in damage_nums if dn.alive]
+            for orb in xp_orbs:
+                orb.update(player)
+                if orb.collected:
+                    player.gain_xp(orb.xp_value)
+            xp_orbs = [orb for orb in xp_orbs if orb.alive]
 
             # 敵との接触ダメージ
             p_rect = pygame.Rect(int(player.x) + 4, int(player.y) + 4,
@@ -754,19 +980,31 @@ def main() -> None:
                 game_over = True
 
         # ── 描画 ──
+        warp_anim += 1
         screen.blit(tile_surf, (0, 0))
+        if current_room == WARP_ROOM:
+            draw_warp_point(screen, WARP_TILE[0], WARP_TILE[1], warp_anim)
         for e in enemies:
             e.draw(screen)
         for ex in explosions:
             ex.draw(screen)
+        for orb in xp_orbs:
+            orb.draw(screen)
+        for dn in damage_nums:
+            dn.draw(screen, font_dmg)
         player.draw(screen)
-        draw_hud(screen, player)
+        draw_hud(screen, player, font_hud)
 
         # 部屋名をHUD右端に表示
         name_txt = font_room.render(
             _TYPE_NAMES.get(ROOM_TYPES.get(current_room, 'main'), ''), True, (200, 200, 200))
         screen.blit(name_txt, (WIN_W - name_txt.get_width() - 12,
                                TILE * ROWS + (HUD_H - name_txt.get_height()) // 2))
+        # 階層表示をHUD中央に表示
+        floor_label = f"地下 {floor_level} 階" if floor_level > 1 else "地上"
+        floor_txt = font_room.render(floor_label, True, (180, 220, 255))
+        screen.blit(floor_txt, (WIN_W // 2 - floor_txt.get_width() // 2,
+                                TILE * ROWS + (HUD_H - floor_txt.get_height()) // 2))
 
         # ── ゲームオーバー画面 ──
         if game_over:
