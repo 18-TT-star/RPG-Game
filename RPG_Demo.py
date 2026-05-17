@@ -5,6 +5,7 @@
 
 import sys
 import random
+import os
 import pygame
 
 # ─── 定数 ────────────────────────────────────────────────
@@ -324,10 +325,29 @@ class Player:
         self.artifacts: list[str] = []  # 所持アーティファクトのidリスト
         self.atk_bonus      = 0  # sharp_eyeなどによる攻撃力ボーナス
         self.inv_multiplier = 1  # mana_shieldによる無敵時間倍率
+        # ── 装備スロット（slot名 -> EQUIP_DEFS キー or None）──
+        self.equipment: dict[str, str | None] = {
+            'weapon':    None,
+            'shield':    None,
+            'body':      None,
+            'accessory': None,
+        }
+        self.owned_equips: list[str] = []  # 入手済み装備IDリスト
+        # ── 斧ダッシュ攻撃 ──
+        # axe_charge_timer > 0 : SPACEを押し続けている間カウントアップ
+        # axe_dash_timer  > 0 : ダッシュ攻撃中（入力ロック）
+        self.axe_charge_timer = 0   # SPACE押下中のチャージフレーム数
+        self.axe_dash_timer   = 0   # ダッシュ攻撃の残りフレーム
+        self.axe_dash_vx      = 0.0 # ダッシュ方向の速度X
+        self.axe_dash_vy      = 0.0 # ダッシュ方向の速度Y
+        self._axe_attacked_set: set = set()  # ダッシュ中にダメージ済みの敵id
 
     # 剣レベル定数
     _XP_THRESHOLDS = [60, 150, 300]  # Lv1→2, Lv2→3, Lv3→4
-    _SWORD_NAMES   = {1: '木の剣', 2: '鉄の剣', 3: '炎の剣', 4: '伝説の剣'}
+    _sword_imgs: dict = {}   # レベル別剣PNG { 1: Surface, ... }
+    _axe_img:    object = None  # 斧PNG
+    _SWORD_NAMES   = {1: 'グローソード Lv1', 2: 'グローソード Lv2', 3: 'グローソード Lv3', 4: 'グローソード Lv4'}
+    _SWORD_DESC    = '駆け出し冒険者が好んで使う、持ち主とともに成長する剣。レベルが上がるほど刃は強化され、より大きな力を引き出せる。'
     _SWORD_COLORS  = {1: (180, 120, 60), 2: (190, 190, 210), 3: (255, 130, 30), 4: (255, 230, 60)}
 
     def attack_damage(self) -> int:
@@ -343,6 +363,29 @@ class Player:
 
     # 移動とタイル衝突
     def update(self, keys) -> None:
+        # ── 斧ダッシュ攻撃中は他の動作を全てロック ──
+        if self.axe_dash_timer > 0:
+            self.axe_dash_timer -= 1
+            spd = math.hypot(self.axe_dash_vx, self.axe_dash_vy)
+            if spd > 0.1:
+                if not self._solid_at(self.x + self.axe_dash_vx, self.y):
+                    self.x += self.axe_dash_vx
+                if not self._solid_at(self.x, self.y + self.axe_dash_vy):
+                    self.y += self.axe_dash_vy
+                # 減速
+                self.axe_dash_vx *= 0.88
+                self.axe_dash_vy *= 0.88
+            # 画面端クランプ
+            margin = (TILE - self.SIZE) / 2
+            self.x = max(0, min(self.x, WIN_W - self.SIZE))
+            self.y = max(0, min(self.y, TILE * ROWS - self.SIZE))
+            # 攻撃タイマー更新だけ行う
+            if self.attack_timer > 0:
+                self.attack_timer -= 1
+                if self.attack_timer == 0:
+                    self._attacked_set.clear()
+            return  # 以降の処理をスキップ
+
         # 攻撃中は移動入力を無視（硬直）
         if self.attack_timer <= 0:
             dx = dy = 0
@@ -453,6 +496,21 @@ class Player:
             return True
         return False
 
+    def start_axe_dash(self) -> bool:
+        """斧ダッシュ攻撃を発動。クールダウン中 or ダッシュ中は無効。"""
+        if self.attack_cooldown > 0 or self.axe_dash_timer > 0:
+            return False
+        fdx, fdy = self.facing
+        spd = 9.0
+        self.axe_dash_vx      = fdx * spd
+        self.axe_dash_vy      = fdy * spd
+        self.axe_dash_timer   = 22        # ダッシュ持続フレーム
+        self.attack_timer     = 22        # ダッシュ中は攻撃モーション扱い
+        self.attack_cooldown  = 40
+        self._axe_attacked_set = set()
+        self._attacked_set.clear()
+        return True
+
     def take_damage(self, amount: int = 1, kbx: float = 0.0, kby: float = 0.0) -> None:
         """ダメージを受ける。無敵時間中は無効。"""
         if self.inv_timer > 0:
@@ -463,12 +521,24 @@ class Player:
         self.kby = kby
 
     def sword_rect(self):
-        """攻撃中なら剣の当たり判定Rectを返す。していなければNone。"""
+        """攻撃中なら剣/斧の当たり判定Rectを返す。していなければNone。"""
         if self.attack_timer <= 0:
             return None
         x, y = int(self.x), int(self.y)
         s = self.SIZE
         fdx, fdy = self.facing
+        # 斧ダッシュ中は前方に広い当たり判定
+        if self.axe_dash_timer > 0:
+            w, h = (38, 20) if fdx != 0 else (20, 38)
+            if fdx == 1:
+                return pygame.Rect(x + s,          y + s // 2 - 10, w, h)
+            elif fdx == -1:
+                return pygame.Rect(x - w,          y + s // 2 - 10, w, h)
+            elif fdy == 1:
+                return pygame.Rect(x + s // 2 - 10, y + s,          h, w)
+            else:
+                return pygame.Rect(x + s // 2 - 10, y - w,          h, w)
+        # 通常剣攻撃
         if fdx == 1:    # 右
             return pygame.Rect(x + s,          y + s // 2 - 6, 26, 12)
         elif fdx == -1: # 左
@@ -484,6 +554,33 @@ class Player:
             return
         x, y = int(self.x), int(self.y)
         s = self.SIZE
+        cx = x + s // 2  # キャラ中心X
+        cy = y + s // 2  # キャラ中心Y
+        fdx, fdy = self.facing
+
+        # ── チャージエフェクト（斧長押し中、16F以降から表示）──
+        if self.axe_charge_timer >= 16:
+            charge_t = min(1.0, (self.axe_charge_timer - 16) / 30)  # 0.0〜1.0
+            pulse = (self.axe_charge_timer % 10) / 10.0              # 0.0〜1.0でループ
+            # 背後に広がるオーラ（半透明円）
+            aura_r = int(18 + charge_t * 14 + pulse * 6)
+            aura_surf = pygame.Surface((aura_r * 2, aura_r * 2), pygame.SRCALPHA)
+            aura_alpha = int(60 + charge_t * 80)
+            aura_col = (240, int(120 + charge_t * 80), 20, aura_alpha)
+            pygame.draw.circle(aura_surf, aura_col, (aura_r, aura_r), aura_r)
+            surf.blit(aura_surf, (cx - aura_r, cy - aura_r))
+            # 火花パーティクル（チャージが一定以上で光の粒）
+            if self.axe_charge_timer >= 28:
+                spark_n = int(charge_t * 5) + 1
+                for i in range(spark_n):
+                    angle = (self.axe_charge_timer * 37 + i * 72) % 360
+                    rad   = math.radians(angle)
+                    dist  = 10 + charge_t * 10
+                    sx    = int(cx + math.cos(rad) * dist)
+                    sy    = int(cy + math.sin(rad) * dist)
+                    spark_r = max(1, int(3 - charge_t))
+                    pygame.draw.circle(surf, (255, 220, 80), (sx, sy), spark_r)
+
         # 体 (緑チュニック)
         body_rect = pygame.Rect(x + 6, y + 12, s - 12, s - 12)
         pygame.draw.rect(surf, (60, 160, 60), body_rect)
@@ -496,19 +593,138 @@ class Player:
             (x + s // 2 + 8, y + 8),
         ]
         pygame.draw.polygon(surf, (60, 160, 60), hat_points)
-        # 盾 (向き左右で位置変更)
-        shield_x = x + 2 if self.dir[0] <= 0 else x + s - 8
-        pygame.draw.rect(surf, (80, 80, 200),
-                         pygame.Rect(shield_x, y + 14, 6, 12))
-        # 攻撃中は剣を描画（レベルに応じた色）
+        # 盾 (向き左右で位置変更、斧構え中は省略)
+        if self.axe_charge_timer == 0:
+            shield_x = x + 2 if self.dir[0] <= 0 else x + s - 8
+            pygame.draw.rect(surf, (80, 80, 200),
+                             pygame.Rect(shield_x, y + 14, 6, 12))
+
+        # ── 斧構えモーション（チャージ16F以降）──
+        if self.axe_charge_timer >= 16:
+            charge_t = min(1.0, (self.axe_charge_timer - 16) / 30)
+            raise_y = int(charge_t * 10)
+            axe_img = Player._axe_img
+            if axe_img:
+                # 向きに応じて斧を頭上に掲げる角度を決める
+                if fdx == 1:
+                    axe_img = pygame.transform.flip(axe_img, True, False)
+                    angle = -45
+                elif fdx == -1: angle = 45
+                elif fdy == 1:  angle = 135
+                else:           angle = -135
+                rotated = pygame.transform.rotate(axe_img, angle)
+                rw, rh = rotated.get_size()
+                rx = cx + fdx * (s // 2) - rw // 2
+                ry = y - rh - raise_y + 4
+                surf.blit(rotated, (rx, ry))
+            else:
+                # フォールバック: ポリゴン
+                arm_cx = cx + fdx * (s // 2 - 4)
+                arm_cy = cy - raise_y
+                handle_ex = arm_cx + fdx * 14
+                handle_ey = arm_cy - 12
+                pygame.draw.line(surf, (120, 80, 30),
+                                 (arm_cx, arm_cy), (handle_ex, handle_ey), 3)
+                tip = (handle_ex, handle_ey)
+                blade_pts = [
+                    tip,
+                    (tip[0] + fdx * 10, tip[1] - 8),
+                    (tip[0] + fdx * 4,  tip[1] + 4),
+                ] if fdx != 0 else [
+                    tip,
+                    (tip[0] - 8, tip[1] + fdy * 10),
+                    (tip[0] + 4, tip[1] + fdy * 4),
+                ]
+                axe_bright = int(180 + charge_t * 60)
+                pygame.draw.polygon(surf, (axe_bright, int(axe_bright * 0.65), 40), blade_pts)
+                pygame.draw.polygon(surf, (255, 220, 100), blade_pts, 1)
+            return  # 構え中はsr描画不要
+
+        # ── 攻撃中の武器描画 ──
         sr = self.sword_rect()
         if sr:
-            sc    = self._SWORD_COLORS[self.sword_level]
-            sc_hi = tuple(min(255, c + 50) for c in sc)
-            pygame.draw.rect(surf, sc, sr)
-            hi = sr.inflate(-4, -4)
-            if hi.width > 0 and hi.height > 0:
-                pygame.draw.rect(surf, sc_hi, hi)
+            if self.axe_dash_timer > 0:
+                # 斧ダッシュスイングアニメーション（刃を固定し弧を描く）
+                axe_img = Player._axe_img
+                if axe_img:
+                    img_w, img_h = axe_img.get_size()
+                    progress = 1.0 - self.axe_dash_timer / 22.0  # 0.0→1.0
+                    arm = s // 2 + img_h // 2 + 4  # 中心からの腕の長さ
+                    if fdx == 1:    # 右: 刃が右、上→下スイング
+                        arc = math.radians(-90 + progress * 180)
+                        bx = cx + arm * math.cos(arc)
+                        by = cy + arm * math.sin(arc)
+                        angle = -45 - progress * 90   # 刃: 右上→右→右下
+                        axe_img = pygame.transform.flip(axe_img, True, False)
+                    elif fdx == -1:  # 左: 刃が左、上→下スイング
+                        arc = math.radians(-90 + progress * 180)
+                        bx = cx - arm * math.cos(arc)
+                        by = cy + arm * math.sin(arc)
+                        angle = 45 + progress * 90    # 刃: 左上→左→左下
+                    elif fdy == -1:  # 上: 刃が上、左→右スイング
+                        arc = math.radians(180 - progress * 180)
+                        bx = cx + arm * math.cos(arc)
+                        by = cy - arm * math.sin(arc)
+                        angle = 45 - progress * 90    # 刃: 左上→上→右上
+                    else:            # 下: 刃が下、右→左スイング
+                        arc = math.radians(progress * 180)
+                        bx = cx + arm * math.cos(arc)
+                        by = cy + arm * math.sin(arc)
+                        angle = -135 - progress * 90  # 刃: 右下→下→左下
+                    rotated = pygame.transform.rotate(axe_img, angle)
+                    rw, rh = rotated.get_size()
+                    surf.blit(rotated, (int(bx - rw // 2), int(by - rh // 2)))
+                else:
+                    # フォールバック: ポリゴン
+                    bx1, by1 = cx, cy
+                    if fdx == 1:
+                        hx, hy = cx + s // 2, cy
+                        blade_pts = [(hx+4, hy-14),(hx+22, hy-10),(hx+22, hy+10),(hx+4, hy+14)]
+                        pygame.draw.line(surf, (120, 80, 30), (bx1, by1), (hx+4, hy), 3)
+                    elif fdx == -1:
+                        hx, hy = cx - s // 2, cy
+                        blade_pts = [(hx-4, hy-14),(hx-22, hy-10),(hx-22, hy+10),(hx-4, hy+14)]
+                        pygame.draw.line(surf, (120, 80, 30), (bx1, by1), (hx-4, hy), 3)
+                    elif fdy == 1:
+                        hx, hy = cx, cy + s // 2
+                        blade_pts = [(hx-14, hy+4),(hx-10, hy+22),(hx+10, hy+22),(hx+14, hy+4)]
+                        pygame.draw.line(surf, (120, 80, 30), (bx1, by1), (hx, hy+4), 3)
+                    else:
+                        hx, hy = cx, cy - s // 2
+                        blade_pts = [(hx-14, hy-4),(hx-10, hy-22),(hx+10, hy-22),(hx+14, hy-4)]
+                        pygame.draw.line(surf, (120, 80, 30), (bx1, by1), (hx, hy-4), 3)
+                    pygame.draw.polygon(surf, (210, 145, 55), blade_pts)
+                    pygame.draw.polygon(surf, (255, 210, 100), blade_pts, 2)
+            else:
+                # 通常攻撃: 斧装備なら斧PNG、それ以外は剣PNG
+                has_axe = self.equipment.get('weapon') == 'axe'
+                atk_img = Player._axe_img if has_axe else Player._sword_imgs.get(self.sword_level)
+                if atk_img:
+                    img_w, img_h = atk_img.get_size()
+                    if fdx == 1:    # 右: CW90°（刃が右）
+                        if has_axe:
+                            atk_img = pygame.transform.flip(atk_img, True, False)
+                        rotated = pygame.transform.rotate(atk_img, -90)
+                        surf.blit(rotated, (x + s, cy - img_w // 2))
+                    elif fdx == -1:  # 左: CCW90°（刃が左）
+                        rotated = pygame.transform.rotate(atk_img, 90)
+                        surf.blit(rotated, (x - img_h, cy - img_w // 2))
+                    elif fdy == 1:   # 下: 180°（刃が下）
+                        rotated = pygame.transform.rotate(atk_img, 180)
+                        surf.blit(rotated, (cx - img_w // 2, y + s))
+                    else:            # 上: 回転なし（刃が上）
+                        surf.blit(atk_img, (cx - img_w // 2, y - img_h))
+                else:
+                    # フォールバック（PNG未ロード時の単純線分）
+                    sc = self._SWORD_COLORS[self.sword_level]
+                    if fdx == 1:
+                        pygame.draw.line(surf, sc, (x + s, cy), (x + s + 22, cy), 4)
+                    elif fdx == -1:
+                        pygame.draw.line(surf, sc, (x, cy), (x - 22, cy), 4)
+                    elif fdy == 1:
+                        pygame.draw.line(surf, sc, (cx, y + s), (cx, y + s + 22), 4)
+                    else:
+                        pygame.draw.line(surf, sc, (cx, y), (cx, y - 22), 4)
 
 
 # ─── Enemy クラス ───────────────────────────────────────────
@@ -1212,12 +1428,13 @@ def draw_hud(surf: pygame.Surface, player: Player, font: pygame.font.Font) -> No
 
 
 # ─── メニュー画面描画 ────────────────────────────────────────────
-_MENU_TABS = ['セーブ', 'ロード', 'アイテム', '装備', 'ステータス', 'アーティファクト', 'オプション']
+_MENU_TABS = ['セーブ', 'ロード', 'アイテム', '装備', 'ステータス', 'オプション']
 _DEMO_LOCKED = {0, 1}  # セーブ・ロードは体験版では不可
 
 def draw_menu(surf: pygame.Surface, player: "Player",
               tab: int, font_title: pygame.font.Font,
-              font_item: pygame.font.Font, floor_level: int) -> None:
+              font_item: pygame.font.Font, floor_level: int,
+              equip_cursor: int = 0) -> None:
     """Mキーで開くメニューオーバーレイを描画する"""
     # ── 半透明暗転 ──
     overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
@@ -1294,16 +1511,44 @@ def draw_menu(surf: pygame.Surface, player: "Player",
                 iy += 50
 
     elif tab == 3:  # 装備
-        sword_name  = Player._SWORD_NAMES[player.sword_level]
-        sword_color = Player._SWORD_COLORS[player.sword_level]
-        lbl  = font_item.render('装備中の剣:', True, (180, 180, 200))
-        swd  = font_title.render(sword_name, True, sword_color)
-        lvl  = font_item.render(f'剣レベル  Lv.{player.sword_level}', True, (160, 160, 160))
-        atk  = font_item.render(f'攻撃力   +{player.sword_level}', True, (160, 160, 160))
-        surf.blit(lbl, (CONTENT_X, CY))
-        surf.blit(swd, (CONTENT_X, CY + 28))
-        surf.blit(lvl, (CONTENT_X, CY + 60))
-        surf.blit(atk, (CONTENT_X, CY + 82))
+        # 選択リスト: [なし] + 所持している装備
+        weapon_list = [None] + player.owned_equips  # None = 防具・素手（グローソードのみ）
+        equipped_id = player.equipment.get('weapon')
+        # 見出し
+        hdr = font_item.render('── 武器選択 ──', True, (180, 180, 220))
+        surf.blit(hdr, (CONTENT_X, CY))
+        hint_eq = font_item.render('Enter/Space : 装備・解除', True, (100, 120, 100))
+        surf.blit(hint_eq, (CONTENT_X + CONTENT_W - hint_eq.get_width(), CY))
+        ROW_H = 46
+        for i, wid in enumerate(weapon_list):
+            iy = CY + 28 + i * ROW_H
+            is_cursor   = (i == equip_cursor)
+            is_equipped = (wid == equipped_id)
+            # カーソル㓓ディング
+            if is_cursor:
+                pygame.draw.rect(surf, (50, 50, 100),
+                                 pygame.Rect(CONTENT_X - 4, iy - 2, CONTENT_W + 4, ROW_H - 4))
+                pygame.draw.rect(surf, (100, 100, 200),
+                                 pygame.Rect(CONTENT_X - 4, iy - 2, CONTENT_W + 4, ROW_H - 4), 1)
+            # 装備中アイコン
+            eq_mark = font_title.render('◆', True, (255, 220, 60)) if is_equipped \
+                      else font_title.render('◇', True, (60, 60, 80))
+            surf.blit(eq_mark, (CONTENT_X, iy + 4))
+            if wid is None:
+                name_col = (220, 220, 220) if is_cursor else (160, 160, 160)
+                nm = font_item.render('なし（グローソードのみ）', True, name_col)
+                surf.blit(nm, (CONTENT_X + 24, iy + 2))
+                atk_s = font_item.render(f'攻撃力 +{player.sword_level}', True, (120, 120, 120))
+                surf.blit(atk_s, (CONTENT_X + 24, iy + 22))
+            else:
+                edef = EQUIP_DEFS[wid]
+                name_col = edef['color'] if is_cursor else tuple(c // 2 + 60 for c in edef['color'])
+                nm = font_title.render(edef['name'], True, name_col)
+                surf.blit(nm, (CONTENT_X + 24, iy + 2))
+                atk_v = edef.get('atk', '?')
+                dash_v = edef.get('atk_dash', '?')
+                atk_s = font_item.render(f'通常:{atk_v}  ダッシュ:{dash_v}', True, (120, 120, 120))
+                surf.blit(atk_s, (CONTENT_X + 24, iy + 22))
 
     elif tab == 4:  # ステータス
         rows = [
@@ -1319,31 +1564,7 @@ def draw_menu(surf: pygame.Surface, player: "Player",
             surf.blit(lbl_s, (CONTENT_X, y))
             surf.blit(val_s, (CONTENT_X + 120, y))
 
-    elif tab == 5:  # アーティファクト
-        if not player.artifacts:
-            msg = font_item.render('アーティファクトはまだ持っていない', True, (160, 160, 160))
-            surf.blit(msg, (CONTENT_X, CY))
-            hint2 = font_item.render('ボス撃破・階層移動で入手できる', True, (120, 120, 120))
-            surf.blit(hint2, (CONTENT_X, CY + 26))
-        else:
-            iy = CY
-            for art_id in player.artifacts:
-                adef = ARTIFACT_DEFS.get(art_id, {})
-                icon_col = adef.get('icon_color', (180, 180, 180))
-                name_str = adef.get('name', art_id)
-                desc_str = adef.get('desc', '')
-                # アイコン（小さい四角）
-                pygame.draw.rect(surf, icon_col, pygame.Rect(CONTENT_X, iy + 2, 20, 20))
-                pygame.draw.rect(surf, (255, 255, 255), pygame.Rect(CONTENT_X, iy + 2, 20, 20), 1)
-                name_txt = font_item.render(name_str, True, icon_col)
-                surf.blit(name_txt, (CONTENT_X + 28, iy))
-                desc_txt = font_item.render(desc_str, True, (150, 160, 150))
-                surf.blit(desc_txt, (CONTENT_X + 28, iy + 22))
-                iy += 52
-                if iy > MENU_Y + MENU_H - 40:
-                    break
-
-    elif tab == 6:  # オプション
+    elif tab == 5:  # オプション
         opts = [
             ('BGM音量',  '▐▐▐▐▐░░░░░  50%'),
             ('SE音量',   '▐▐▐▐▐▐▐░░░  70%'),
@@ -1360,7 +1581,11 @@ def draw_menu(surf: pygame.Surface, player: "Player",
             surf.blit(vs, (CONTENT_X + 130, y))
 
     # ── 操作説明 (下部) ──
-    hint = font_item.render('↑↓ : タブ切替     M / ESC : 閉じる', True, (100, 100, 130))
+    if tab == 3:
+        hint_txt = '↑↓ : タブ切替   ←→ : 項目選択   Enter/Z : 装備・解除   M/ESC : 閉じる'
+    else:
+        hint_txt = '↑↓ : タブ切替     M / ESC : 閉じる'
+    hint = font_item.render(hint_txt, True, (100, 100, 130))
     surf.blit(hint, (WIN_W // 2 - hint.get_width() // 2, MENU_Y + MENU_H - hint.get_height() - 8))
 
 
@@ -1622,8 +1847,16 @@ class ItemPopup:
 
     def draw(self, surf: pygame.Surface, font: pygame.font.Font) -> None:
         t = self.timer / self.DURATION
-        name = ITEM_DEFS[self.item_kind]['name']
-        color = ITEM_DEFS[self.item_kind]['color']
+        # ITEM_DEFS → EQUIP_DEFS の順で名前・色を解決
+        if self.item_kind in ITEM_DEFS:
+            name  = ITEM_DEFS[self.item_kind]['name']
+            color = ITEM_DEFS[self.item_kind]['color']
+        elif self.item_kind in EQUIP_DEFS:
+            name  = EQUIP_DEFS[self.item_kind]['name']
+            color = EQUIP_DEFS[self.item_kind]['color']
+        else:
+            name  = self.item_kind
+            color = (200, 200, 200)
         # フェードイン/アウト（最初と最後の20フレーム）
         if t > 0.85:
             alpha = int(255 * (1.0 - t) / 0.15)
@@ -1651,6 +1884,25 @@ ITEM_DEFS = {
     'para_drug':{'name': '麻痺薬',     'color': (220, 200, 50), 'max_stack': 9},
 }
 _CHEST_ITEMS = ['potion', 'para_drug']
+
+# ─── 装備定義 ─────────────────────────────────────────────────────────────────
+# slot  : 'weapon'
+# color : メニューアイコン色
+EQUIP_DEFS: dict[str, dict] = {
+
+    # ── 武器 ────────────────────────────────────────────────────────────────
+    'axe': {
+        'name': '戦斧',
+        'slot': 'weapon',
+        'color': (200, 140, 60),
+        'atk': 4,              # 剣レベルとは独立した固定攻撃力
+        'atk_dash': 7,         # ダッシュ斬り時の攻撃力
+        'desc': 'SPACEを長押し後に離すと前方ダッシュ斬り。通常攻撃より威力が高い。',
+    },
+}
+
+# ボス撃破時の宝箱から出る装備（固定）
+_BOSS_EQUIP_POOL: list[str] = ['axe']
 
 
 # ─── 飛翔体（毒矢・痺薬）エフェクト ─────────────────────────────────
@@ -1944,6 +2196,25 @@ def _pick_artifact_choices(player: "Player", n: int = 3) -> list[str]:
     return random.sample(pool, min(n, len(pool)))
 
 
+# ─── 装備着脱 ─────────────────────────────────────────────────────────────────
+def _remove_equip(player: "Player", slot: str) -> None:
+    """スロットの装備を外してステータスを元に戻す（効果実装後に中身を追加）"""
+    old = player.equipment.get(slot)
+    if old is None:
+        return
+    # TODO: 各装備の効果を取り消す（効果実装後に追加）
+    player.equipment[slot] = None
+
+
+def _apply_equip(player: "Player", equip_id: str) -> None:
+    """装備を装着してステータスを適用する（効果実装後に中身を追加）"""
+    slot = EQUIP_DEFS[equip_id]['slot']
+    _remove_equip(player, slot)          # 既存装備を先に外す
+    player.equipment[slot] = equip_id
+    # TODO: 各装備の効果を適用する（効果実装後に追加）
+
+
+
 def _apply_artifact(player: "Player", art_id: str) -> None:
     """アーティファクトの即時効果をプレイヤーに適用する。"""
     if art_id == 'iron_heart':
@@ -1966,6 +2237,15 @@ def main() -> None:
     global CURRENT_MAP, WARP_ROOM, WARP_TILE
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
+    # スプライト読み込み (sword_lv1〜4.png, chargeax.png) ─ set_mode() の後で convert_alpha() を呼ぶ
+    _sword_dir = os.path.dirname(os.path.abspath(__file__)) or '.'
+    for _lv in range(1, 5):
+        _p = os.path.join(_sword_dir, f'sword_lv{_lv}.png')
+        if os.path.exists(_p):
+            Player._sword_imgs[_lv] = pygame.image.load(_p).convert_alpha()
+    _axe_path = os.path.join(_sword_dir, 'chargeax.png')
+    if os.path.exists(_axe_path):
+        Player._axe_img = pygame.image.load(_axe_path).convert_alpha()
     pygame.display.set_caption("Zelda-like  ─  One Screen Prototype")
     clock = pygame.time.Clock()
     font_room       = pygame.font.SysFont("msgothic", 18)
@@ -2011,8 +2291,9 @@ def main() -> None:
     door_cooldown = 0  # 連続遷移防止
     warp_anim   = 0   # ワープ光輪アニメーションカウンタ
     debug_warp  = False  # Pキーで生成したデバッグワープかどうか
-    menu_open   = False
-    menu_tab    = 0   # 0=セーブ 1=ロード 2=アイテム 3=装備 4=ステータス 5=アーティファクト 6=オプション
+    menu_open    = False
+    menu_tab     = 0   # 0=セーブ 1=ロード 2=アイテム 3=装備 4=ステータス 5=オプション
+    equip_cursor = 0   # 装備タブ内のカーソル位置
     game_over = False
     # ── アーティファクト選択 ──
     artifact_choices: list = []   # 提示中の3候補ID
@@ -2040,6 +2321,11 @@ def main() -> None:
                         pass  # 選択中はESCで閉じない
                     else:
                         running = False
+                elif event.key == pygame.K_i:
+                    # デバッグ: 斧を付与して装備（持っていなければ所持リストにも追加）
+                    if 'axe' not in player.owned_equips:
+                        player.owned_equips.append('axe')
+                    _apply_equip(player, 'axe')
                 # アーティファクト選択中の操作
                 elif artifact_choices:
                     if event.key == pygame.K_LEFT:
@@ -2056,13 +2342,38 @@ def main() -> None:
                     if not game_over:
                         menu_open = not menu_open
                 elif menu_open:
+                    # ↑↓: 常にタブ切替
                     if event.key == pygame.K_UP:
                         menu_tab = (menu_tab - 1) % len(_MENU_TABS)
+                        equip_cursor = 0
                     elif event.key == pygame.K_DOWN:
                         menu_tab = (menu_tab + 1) % len(_MENU_TABS)
+                        equip_cursor = 0
+                    # 装備タブのみ: ←→で項目選択、Enter/Spaceで装備操作
+                    elif menu_tab == 3:
+                        _wlist = [None] + player.owned_equips
+                        if event.key == pygame.K_LEFT:
+                            equip_cursor = (equip_cursor - 1) % len(_wlist)
+                        elif event.key == pygame.K_RIGHT:
+                            equip_cursor = (equip_cursor + 1) % len(_wlist)
+                        elif event.key in (pygame.K_RETURN, pygame.K_z):
+                            selected_wid = _wlist[equip_cursor]
+                            if selected_wid is None:
+                                _remove_equip(player, 'weapon')
+                                player.axe_charge_timer = 0
+                                player.axe_dash_timer   = 0
+                            else:
+                                _apply_equip(player, selected_wid)
                 elif event.key == pygame.K_SPACE:
                     if not game_over:
-                        player.try_attack()
+                        has_axe = player.equipment.get('weapon') == 'axe'
+                        if has_axe:
+                            # 斧所持: 即座に通常攻撃 + チャージカウント開始
+                            player.try_attack()
+                            player.axe_charge_timer = 1
+                        else:
+                            # 斧なし: 従来通りの即攻撃
+                            player.try_attack()
                 elif event.key == pygame.K_q and not game_over:
                     # 選択中アイテムを使用
                     kind = player._item_slots[player.selected_slot]
@@ -2127,10 +2438,25 @@ def main() -> None:
                     menu_open   = False
                     menu_tab    = 0
                     game_over = False
+            elif event.type == pygame.KEYUP:
+                if event.key == pygame.K_SPACE and not game_over and not menu_open:
+                    if player.axe_charge_timer > 0:
+                        if player.axe_charge_timer >= 30:
+                            # 十分チャージ → ダッシュ攻撃
+                            player.start_axe_dash()
+                        # チャージ不足は通常攻撃済みなので何もしない
+                        player.axe_charge_timer = 0
 
         # ── 更新 ──
         if not game_over and not menu_open and not artifact_choices:
             keys = pygame.key.get_pressed()
+            # 斧チャージカウントアップ（SPACE押しっぱなし中）
+            if player.axe_charge_timer > 0:
+                if keys[pygame.K_SPACE]:
+                    player.axe_charge_timer += 1
+                else:
+                    # キーが既に離れていた場合（稀に発生）もリセット
+                    player.axe_charge_timer = 0
             player.update(keys)
             for e in enemies:
                 pdmg = e.update(player.x, player.y)
@@ -2195,40 +2521,49 @@ def main() -> None:
                     enemy_arrows.clear()
                     boss = None
                     door_cooldown = 90
-                    # 階層移動時にアーティファクト選択画面を開く
-                    artifact_choices = _pick_artifact_choices(player)
-                    artifact_cursor  = 0
+                    # ── アーティファクト選択（現在無効化中）──
+                    # artifact_choices = _pick_artifact_choices(player)
+                    # artifact_cursor  = 0
 
-            # 剣の当たり判定
+            # 剣 / 斧ダッシュの当たり判定
             sword_r = player.sword_rect()
             if sword_r:
+                # ダッシュ中は _axe_attacked_set で重複チェック（1回のダッシュで複数ヒット可）
+                atk_set = player._axe_attacked_set if player.axe_dash_timer > 0 else player._attacked_set
+                # 斧装備中は剣レベルと独立した固定攻撃力を使用
+                _axe_def = EQUIP_DEFS.get('axe', {})
+                if player.equipment.get('weapon') == 'axe':
+                    dmg_base = _axe_def.get('atk_dash', 7) if player.axe_dash_timer > 0 \
+                               else _axe_def.get('atk', 4)
+                else:
+                    dmg_base = player.attack_damage()
                 for e in enemies:
-                    if id(e) not in player._attacked_set:
+                    if id(e) not in atk_set:
                         e_rect = pygame.Rect(int(e.x), int(e.y), e.SIZE, e.SIZE)
                         if sword_r.colliderect(e_rect):
                             _dx = (e.x + e.SIZE / 2) - (player.x + player.SIZE / 2)
                             _dy = (e.y + e.SIZE / 2) - (player.y + player.SIZE / 2)
                             _d  = max(1.0, math.hypot(_dx, _dy))
-                            dmg = player.attack_damage()
+                            dmg = dmg_base
                             e.take_damage(dmg, _dx / _d * 9.0, _dy / _d * 9.0)
-                            player._attacked_set.add(id(e))
+                            atk_set.add(id(e))
                             damage_nums.append(DamageNumber(
                                 e.x + e.SIZE / 2, e.y, dmg))
                             # fire_ring: ヒット時に小爆発
                             if 'fire_ring' in player.artifacts:
                                 explosions.append(Explosion(e.x + e.SIZE/2, e.y + e.SIZE/2))
-                # ボスへの剣当たり判定（ボス部屋のみ）
+                # ボスへの剣/斧当たり判定（ボス部屋のみ）
                 if boss and boss.alive and ROOM_TYPES.get(current_room) == 'boss':
                     b_rect = pygame.Rect(int(boss.x), int(boss.y), Boss.SIZE, Boss.SIZE)
-                    if sword_r.colliderect(b_rect) and id(boss) not in player._attacked_set:
+                    if sword_r.colliderect(b_rect) and id(boss) not in atk_set:
                         _dx = (boss.x + Boss.SIZE/2) - (player.x + player.SIZE/2)
                         _dy = (boss.y + Boss.SIZE/2) - (player.y + player.SIZE/2)
                         _d  = max(1.0, math.hypot(_dx, _dy))
-                        dmg = player.attack_damage()
+                        dmg = dmg_base
                         boss.take_damage(dmg)
-                        player._attacked_set.add(id(boss))
+                        atk_set.add(id(boss))
                         damage_nums.append(DamageNumber(boss.x + Boss.SIZE/2, boss.y, dmg))
-                        # 剣攻撃でボスが死亡した場合も演出シーケンスを開始
+                        # 剣/斧攻撃でボスが死亡した場合も演出シーケンスを開始
                         if not boss.alive and boss_death_seq == 0:
                             boss_death_cx = boss.x + Boss.SIZE / 2
                             boss_death_cy = boss.y + Boss.SIZE / 2
@@ -2261,10 +2596,18 @@ def main() -> None:
             for ch in chests:
                 got = ch.try_open(player)
                 if got:
-                    cur = player.inventory.get(got, 0)
-                    max_s = ITEM_DEFS[got]['max_stack']
-                    player.inventory[got] = min(max_s, cur + 1)
-                    item_popups.append(ItemPopup(got))
+                    if got in EQUIP_DEFS:
+                        # 装備アイテム → 所持リストに追加しスロットに装着
+                        if got not in player.owned_equips:
+                            player.owned_equips.append(got)
+                        _apply_equip(player, got)
+                        item_popups.append(ItemPopup(got))
+                    else:
+                        # 消耗品 → インベントリへ
+                        cur = player.inventory.get(got, 0)
+                        max_s = ITEM_DEFS[got]['max_stack']
+                        player.inventory[got] = min(max_s, cur + 1)
+                        item_popups.append(ItemPopup(got))
                     opened_any = True
             if opened_any:
                 chests = [ch for ch in chests if not ch.opened]
@@ -2362,17 +2705,16 @@ def main() -> None:
                 if boss_death_seq == 0:
                     room_cx = WIN_W / 2
                     room_cy = TILE * (ROWS // 2 + 2)
-                    for off_x in [-TILE, 0, TILE]:
-                        cx_ = room_cx + off_x - Chest.SIZE / 2
-                        cy_ = room_cy - Chest.SIZE / 2
-                        kind_ = random.choice(_CHEST_ITEMS)
-                        chests.append(Chest(float(cx_), float(cy_), kind_))
+                    # ボス宝箱: 戦斧1個（中央に固定）
+                    cx_ = room_cx - Chest.SIZE / 2
+                    cy_ = room_cy - Chest.SIZE / 2
+                    chests.append(Chest(float(cx_), float(cy_), 'axe'))
                     ACTIVE_CHESTS[:] = chests
                     WARP_ROOM = current_room
                     WARP_TILE = (int(room_cx // TILE), int((room_cy + Chest.SIZE) // TILE) + 1)
-                    # アーティファクト選択画面を開く
-                    artifact_choices = _pick_artifact_choices(player)
-                    artifact_cursor  = 0
+                    # ── アーティファクト選択（現在無効化中）──
+                    # artifact_choices = _pick_artifact_choices(player)
+                    # artifact_cursor  = 0
 
             # 画面揺れ更新
             if shake_timer > 0:
@@ -2440,14 +2782,15 @@ def main() -> None:
         screen.blit(floor_txt, (WIN_W // 2 - floor_txt.get_width() // 2,
                                 TILE * ROWS + (HUD_H - floor_txt.get_height()) // 2))
 
-        # ── アーティファクト選択画面 ──
-        if artifact_choices:
-            draw_artifact_select(screen, artifact_choices, artifact_cursor,
-                                 font_menu_title, font_menu_item)
+        # ── アーティファクト選択画面（現在無効化中）──
+        # if artifact_choices:
+        #     draw_artifact_select(screen, artifact_choices, artifact_cursor,
+        #                          font_menu_title, font_menu_item)
 
         # ── メニュー画面 ──
         if menu_open:
-            draw_menu(screen, player, menu_tab, font_menu_title, font_menu_item, floor_level)
+            draw_menu(screen, player, menu_tab, font_menu_title, font_menu_item, floor_level,
+                      equip_cursor)
 
         # ── ゲームオーバー画面 ──
         if game_over:
